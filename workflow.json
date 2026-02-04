@@ -1,0 +1,326 @@
+{
+  "name": "Inbox Hub",
+  "nodes": [
+    {
+      "id": "trigger-zelin",
+      "name": "Gmail Trigger (zelin.agent)",
+      "type": "n8n-nodes-base.gmailTrigger",
+      "typeVersion": 1.2,
+      "position": [-800, 0],
+      "parameters": {
+        "pollTimes": {
+          "item": [{"mode": "everyMinute"}]
+        },
+        "simple": false,
+        "filters": {},
+        "options": {}
+      },
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "",
+          "name": "Gmail account - zelin.agent@gmail.com"
+        }
+      }
+    },
+    {
+      "id": "trigger-wan",
+      "name": "Gmail Trigger (wanzelin007)",
+      "type": "n8n-nodes-base.gmailTrigger",
+      "typeVersion": 1.2,
+      "position": [-800, 200],
+      "parameters": {
+        "pollTimes": {
+          "item": [{"mode": "everyMinute"}]
+        },
+        "simple": false,
+        "filters": {},
+        "options": {}
+      },
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "",
+          "name": "Gmail account - wanzelin007@gmail.com"
+        }
+      }
+    },
+    {
+      "id": "unify-input",
+      "name": "Unify Input",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-560, 100],
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const email = $input.item.json;\n\n// Detect email source - try multiple methods\nlet emailSource = '';\n\n// Method 1: Try to detect from trigger node data\ntry {\n  const wanData = $('Gmail Trigger (wanzelin007)').first();\n  if (wanData?.json?.id === email.id) emailSource = 'wanzelin007';\n} catch (e) {}\n\nif (!emailSource) {\n  try {\n    const zelinData = $('Gmail Trigger (zelin.agent)').first();\n    if (zelinData?.json?.id === email.id) emailSource = 'zelin.agent';\n  } catch (e) {}\n}\n\n// Method 2: Fallback to recipient detection\nif (!emailSource) {\n  const toField = (email.to?.text || '').toLowerCase();\n  emailSource = toField.includes('zelin.agent') ? 'zelin.agent' : 'wanzelin007';\n}\n\n// Extract body with HTML fallback\nlet body = email.text || email.textPlain || '';\nif (!body && email.html) {\n  body = email.html.replace(/<[^>]+>/g, ' ').replace(/\\s+/g, ' ').trim();\n}\nif (!body) body = email.snippet || '';\n\n// Limit body length\nif (body.length > 3000) {\n  body = body.substring(0, 3000) + '...';\n}\n\nreturn [{\n  json: {\n    source: 'gmail',\n    emailSource: emailSource,\n    emailId: email.id,\n    from: email.from?.text || 'Unknown',\n    subject: email.subject || '',\n    body: body,\n    receivedAt: email.date,\n    originalData: email\n  }\n}];"
+      }
+    },
+    {
+      "id": "prep-detect-event",
+      "name": "Prep Detect Event",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-320, 100],
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const input = $input.item.json;\n\nconst systemPrompt = `You are an event detection assistant. Analyze messages to detect if they contain a scheduled event.\n\nDetect events like:\n- Meeting invitations (\"Let's meet tomorrow at 3pm\")\n- Appointments (\"Your appointment is scheduled for Feb 10 at 2:30 PM\")\n- Interviews (\"Interview scheduled for Monday, February 10th, 2026 at 10:00 AM PST\")\n- Activities (\"The concert is on Saturday at 7pm\")\n- Reminders with time (\"Don't forget dentist on Tuesday morning\")\n\nFor each detected event, extract:\n- hasScheduledEvent: boolean - true ONLY if there's a specific scheduled event with date/time\n- eventTitle: descriptive title for the calendar event\n- eventDatetime: ISO 8601 format with timezone (e.g., 2026-02-10T14:00:00-08:00)\n- eventEndDatetime: ISO 8601 or null (default: start + 30 min if not specified)\n- eventLocation: location if mentioned, null otherwise\n- eventDescription: brief context about the event\n\nHandle relative dates based on the email received date:\n- \"tomorrow\" = next day from email received date\n- \"next Monday\" = the coming Monday\n- \"in 2 hours\" = from email time\n\nDefault timezone: America/Los_Angeles (Pacific Time)\n\nIMPORTANT: Only return hasScheduledEvent=true if there's a SPECIFIC date/time mentioned. Generic phrases like \"let's meet sometime\" or \"we should catch up\" are NOT events.`;\n\nconst userContent = `Email received at: ${input.receivedAt || new Date().toISOString()}\nCurrent timezone: America/Los_Angeles\n\nFrom: ${input.from}\nSubject: ${input.subject}\n\nBody:\n${input.body}`;\n\nreturn [{\n  json: {\n    model: 'gpt-5.2',\n    input: [\n      { role: 'system', content: systemPrompt },\n      { role: 'user', content: userContent }\n    ],\n    text: {\n      format: {\n        type: 'json_schema',\n        name: 'event_detection',\n        strict: true,\n        schema: {\n          type: 'object',\n          properties: {\n            hasScheduledEvent: { type: 'boolean', description: 'Whether a scheduled event was detected' },\n            eventTitle: { type: ['string', 'null'], description: 'Title for the calendar event' },\n            eventDatetime: { type: ['string', 'null'], description: 'Start datetime in ISO 8601 format' },\n            eventEndDatetime: { type: ['string', 'null'], description: 'End datetime in ISO 8601 format' },\n            eventLocation: { type: ['string', 'null'], description: 'Event location if mentioned' },\n            eventDescription: { type: ['string', 'null'], description: 'Brief context about the event' }\n          },\n          required: ['hasScheduledEvent', 'eventTitle', 'eventDatetime', 'eventEndDatetime', 'eventLocation', 'eventDescription'],\n          additionalProperties: false\n        }\n      }\n    },\n    reasoning: { effort: 'medium' },\n    _inputData: input\n  }\n}];"
+      }
+    },
+    {
+      "id": "detect-event-gpt",
+      "name": "Detect Event (GPT-5.2)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.1,
+      "position": [-80, 100],
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.openai.com/v1/responses",
+        "authentication": "predefinedCredentialType",
+        "nodeCredentialType": "openAiApi",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({model: $json.model, input: $json.input, text: $json.text, reasoning: $json.reasoning}) }}",
+        "options": {}
+      },
+      "credentials": {
+        "openAiApi": {
+          "id": "",
+          "name": "OpenAi account"
+        }
+      }
+    },
+    {
+      "id": "parse-event",
+      "name": "Parse Event Response",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [160, 100],
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const response = $input.item.json;\nconst inputData = $('Prep Detect Event').item.json._inputData;\n\n// Parse GPT response\nconst messageOutput = response.output?.find(o => o.type === 'message');\nif (!messageOutput) {\n  throw new Error('No message output found in GPT response');\n}\n\nconst resultText = messageOutput.content[0].text;\nconst result = JSON.parse(resultText);\n\n// Calculate end time if not provided (default 30 min)\nlet endDatetime = result.eventEndDatetime;\nif (result.hasScheduledEvent && result.eventDatetime && !endDatetime) {\n  const start = new Date(result.eventDatetime);\n  const end = new Date(start.getTime() + 30 * 60 * 1000);\n  endDatetime = end.toISOString();\n}\n\nreturn [{\n  json: {\n    hasScheduledEvent: result.hasScheduledEvent,\n    eventTitle: result.eventTitle,\n    eventDatetime: result.eventDatetime,\n    eventEndDatetime: endDatetime,\n    eventLocation: result.eventLocation,\n    eventDescription: result.eventDescription,\n    source: inputData.source,\n    emailSource: inputData.emailSource,\n    emailId: inputData.emailId,\n    from: inputData.from,\n    subject: inputData.subject\n  }\n}];"
+      }
+    },
+    {
+      "id": "check-has-event",
+      "name": "Check Has Event",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [400, 100],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "has-event-check",
+              "leftValue": "={{ $json.hasScheduledEvent }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "create-calendar-event",
+      "name": "Create Calendar Event",
+      "type": "n8n-nodes-base.googleCalendar",
+      "typeVersion": 1.2,
+      "position": [640, 0],
+      "parameters": {
+        "resource": "event",
+        "operation": "create",
+        "calendar": {
+          "__rl": true,
+          "value": "primary",
+          "mode": "id"
+        },
+        "start": "={{ $json.eventDatetime }}",
+        "end": "={{ $json.eventEndDatetime }}",
+        "additionalFields": {
+          "summary": "={{ $json.eventTitle }}",
+          "location": "={{ $json.eventLocation }}",
+          "description": "=Source: {{ $json.source }}\nFrom: {{ $json.from }}\nSubject: {{ $json.subject }}\n\n{{ $json.eventDescription }}"
+        }
+      },
+      "credentials": {
+        "googleCalendarOAuth2Api": {
+          "id": "",
+          "name": "Google Calendar account"
+        }
+      }
+    },
+    {
+      "id": "route-account",
+      "name": "Route Account",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [880, 100],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "email-source-check",
+              "leftValue": "={{ $json.emailSource }}",
+              "rightValue": "zelin.agent",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "mark-read-zelin",
+      "name": "Mark Read (zelin.agent)",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [1120, 0],
+      "parameters": {
+        "operation": "markAsRead",
+        "messageId": "={{ $json.emailId }}"
+      },
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "",
+          "name": "Gmail account - zelin.agent@gmail.com"
+        }
+      }
+    },
+    {
+      "id": "mark-read-wan",
+      "name": "Mark Read (wanzelin007)",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [1120, 200],
+      "parameters": {
+        "operation": "markAsRead",
+        "messageId": "={{ $json.emailId }}"
+      },
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "",
+          "name": "Gmail account - wanzelin007@gmail.com"
+        }
+      }
+    },
+    {
+      "id": "sticky-main",
+      "name": "Sticky Note",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [-800, 400],
+      "parameters": {
+        "content": "## Inbox Hub - Personal Automation\n\nMonitors Gmail accounts for new emails, detects scheduled events using GPT-5.2, and automatically creates Google Calendar events.\n\n### Flow\n1. **Gmail Triggers** - Poll both accounts every minute\n2. **Unify Input** - Standardize email format, detect source account\n3. **Detect Event (GPT-5.2)** - AI extracts scheduling info\n4. **Check Has Event** - Route based on detection result\n5. **Create Calendar Event** - Add to primary calendar\n6. **Mark Read** - Mark email as read using correct account\n\n### Event Detection Examples\n- \"Meeting with John tomorrow at 2pm at Starbucks\"\n- \"Interview scheduled for Monday, February 10th at 10:00 AM PST\"\n- \"Don't forget dentist on Tuesday morning\"\n\n### Settings\n- Default event duration: 30 minutes\n- Default timezone: America/Los_Angeles",
+        "height": 400,
+        "width": 480,
+        "color": 4
+      }
+    },
+    {
+      "id": "sticky-triggers",
+      "name": "Sticky Note1",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [-1040, 0],
+      "parameters": {
+        "content": "## 1. Email Triggers\nMonitors both Gmail accounts",
+        "height": 280,
+        "width": 200
+      }
+    },
+    {
+      "id": "sticky-detect",
+      "name": "Sticky Note2",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [-320, -60],
+      "parameters": {
+        "content": "## 2. Event Detection\nGPT-5.2 extracts scheduling info",
+        "height": 80,
+        "width": 520
+      }
+    },
+    {
+      "id": "sticky-calendar",
+      "name": "Sticky Note3",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [640, -120],
+      "parameters": {
+        "content": "## 3. Calendar Creation\nAdds event to primary calendar",
+        "height": 80,
+        "width": 200
+      }
+    },
+    {
+      "id": "sticky-mark-read",
+      "name": "Sticky Note4",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [1120, -120],
+      "parameters": {
+        "content": "## 4. Mark Read\nUses correct Gmail credential",
+        "height": 80,
+        "width": 200
+      }
+    }
+  ],
+  "connections": {
+    "Gmail Trigger (zelin.agent)": {
+      "main": [[{"node": "Unify Input", "type": "main", "index": 0}]]
+    },
+    "Gmail Trigger (wanzelin007)": {
+      "main": [[{"node": "Unify Input", "type": "main", "index": 0}]]
+    },
+    "Unify Input": {
+      "main": [[{"node": "Prep Detect Event", "type": "main", "index": 0}]]
+    },
+    "Prep Detect Event": {
+      "main": [[{"node": "Detect Event (GPT-5.2)", "type": "main", "index": 0}]]
+    },
+    "Detect Event (GPT-5.2)": {
+      "main": [[{"node": "Parse Event Response", "type": "main", "index": 0}]]
+    },
+    "Parse Event Response": {
+      "main": [[{"node": "Check Has Event", "type": "main", "index": 0}]]
+    },
+    "Check Has Event": {
+      "main": [
+        [{"node": "Create Calendar Event", "type": "main", "index": 0}],
+        [{"node": "Route Account", "type": "main", "index": 0}]
+      ]
+    },
+    "Create Calendar Event": {
+      "main": [[{"node": "Route Account", "type": "main", "index": 0}]]
+    },
+    "Route Account": {
+      "main": [
+        [{"node": "Mark Read (zelin.agent)", "type": "main", "index": 0}],
+        [{"node": "Mark Read (wanzelin007)", "type": "main", "index": 0}]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "America/Los_Angeles"
+  }
+}
